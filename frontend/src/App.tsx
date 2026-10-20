@@ -1,207 +1,570 @@
-import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, AuditRow, csv, Mandate, money, Purchase, Spend, Status } from "./api";
+import {
+  Gauge,
+  Lock,
+  ShieldCheck,
+  Sparkles,
+  TriangleAlert,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  api,
+  ApiError,
+  clearOwnerKey,
+  getOwnerKey,
+  publicStatus,
+  setOwnerKey,
+  verifyOwnerKey,
+  type AuditRow,
+  type CatalogItem,
+  type Mandate,
+  type Purchase,
+  type Spend,
+  type Status,
+} from "./api";
+import { AgentComposer } from "./components/AgentComposer";
+import { AuditView } from "./components/AuditView";
+import { BudgetCard } from "./components/BudgetCard";
+import { KeyGate } from "./components/KeyGate";
+import { Logo } from "./components/Logo";
+import { MandateView } from "./components/MandateView";
+import { ConfirmDialog } from "./components/Modal";
+import { PurchasesView } from "./components/PurchasesView";
+import { Toast, type ToastMessage } from "./components/Toast";
+import { Badge } from "./components/ui";
+import { purchaseCounts, sortPurchases, type PurchaseFilter } from "./lib/purchases";
 
 type Tab = "purchases" | "mandate" | "audit";
-const EXAMPLES = ["buy 2 reams of printer paper under $40", "we need coffee beans", "order a monitor for the new hire", "buy a gift card bundle"];
-const SCENARIOS: [string, string][] = [
-  ["routine", "Routine purchases"], ["needs_approval", "Needs approval"],
-  ["poisoned_listing", "Poisoned listing (prompt injection)"], ["blocked_category", "Out-of-mandate category"],
+type Workspace = {
+  spend: Spend;
+  mandate: Mandate;
+  purchases: Purchase[];
+  audit: AuditRow[];
+  categories: string[];
+};
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: "purchases", label: "Purchases" },
+  { id: "mandate", label: "Mandate" },
+  { id: "audit", label: "Audit log" },
 ];
 
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
-  const [spend, setSpend] = useState<Spend | null>(null);
-  const [mandate, setMandate] = useState<Mandate | null>(null);
-  const [purchases, setPurchases] = useState<Purchase[]>([]);
-  const [audit, setAudit] = useState<AuditRow[]>([]);
-  const [tab, setTab] = useState<Tab>("purchases");
-  const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [goal, setGoal] = useState("");
+  const [authState, setAuthState] = useState<"checking" | "locked" | "unlocked">(
+    "checking",
+  );
+  const [gateBusy, setGateBusy] = useState(false);
+  const [gateError, setGateError] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    try {
-      const [s, sp, m, p, a] = await Promise.all([
-        api<Status>("/status"), api<Spend>("/spend"), api<Mandate>("/mandate"),
-        api<Purchase[]>("/purchases"), api<AuditRow[]>("/audit"),
-      ]);
-      setStatus(s); setSpend(sp); setMandate(m); setPurchases(p); setAudit(a);
-    } catch (e) { setMsg({ kind: "err", text: (e as Error).message }); }
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>("purchases");
+  const [filter, setFilter] = useState<PurchaseFilter>("all");
+  const [query, setQuery] = useState("");
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [toast, setToast] = useState<ToastMessage | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  const notify = useCallback((kind: ToastMessage["kind"], text: string) => {
+    setToast({ id: Date.now(), kind, text });
   }, []);
 
-  useEffect(() => { refresh(); const t = setInterval(refresh, 8000); return () => clearInterval(t); }, [refresh]);
+  const dismissToast = useCallback(() => setToast(null), []);
 
-  const run = async (label: string, fn: () => Promise<unknown>) => {
-    setBusy(true); setMsg(null);
-    try { await fn(); setMsg({ kind: "ok", text: label }); } catch (e) {
-      setMsg({ kind: "err", text: e instanceof ApiError ? e.message : "Unexpected error" });
-    } finally { setBusy(false); await refresh(); }
-  };
+  const lock = useCallback(() => {
+    clearOwnerKey();
+    setWorkspace(null);
+    setAuthState("locked");
+    setGateError(null);
+  }, []);
 
-  const submitGoal = (g: string) => run("Agent proposal evaluated against the mandate.", async () => {
-    const r = await api<{ purchases: Purchase[]; message?: string; planner: string }>("/agent/plan", { method: "POST", body: JSON.stringify({ goal: g }) });
-    if (!r.purchases.length) throw new ApiError(r.message ?? "Nothing matched.");
-    setGoal("");
-  });
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const result = await publicStatus();
+        if (!cancelled) setStatus(result);
+      } catch {
+        /* the key gate surfaces connectivity problems when unlocking */
+      }
+
+      const key = getOwnerKey();
+      if (!key) {
+        if (!cancelled) setAuthState("locked");
+        return;
+      }
+
+      try {
+        const ok = await verifyOwnerKey(key);
+        if (cancelled) return;
+        if (ok) setAuthState("unlocked");
+        else {
+          clearOwnerKey();
+          setAuthState("locked");
+        }
+      } catch {
+        if (!cancelled) setAuthState("locked");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const refresh = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    try {
+      const [nextStatus, spend, mandate, purchases, audit, catalog] =
+        await Promise.all([
+          api<Status>("/status"),
+          api<Spend>("/spend"),
+          api<Mandate>("/mandate"),
+          api<Purchase[]>("/purchases"),
+          api<AuditRow[]>("/audit"),
+          api<CatalogItem[]>("/catalog"),
+        ]);
+
+      setStatus(nextStatus);
+      setWorkspace({
+        spend,
+        mandate,
+        purchases: sortPurchases(purchases),
+        audit,
+        categories: Array.from(new Set(catalog.map((item) => item.category))),
+      });
+      setError(null);
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 401) {
+        lock();
+        return;
+      }
+      setError(
+        cause instanceof Error ? cause.message : "Could not load the workspace.",
+      );
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [lock]);
+
+  useEffect(() => {
+    if (authState !== "unlocked") return;
+    void refresh();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refresh(true);
+    }, 8000);
+    return () => window.clearInterval(timer);
+  }, [authState, refresh]);
+
+  async function unlock(key: string) {
+    setGateBusy(true);
+    setGateError(null);
+    try {
+      const ok = await verifyOwnerKey(key);
+      if (!ok) {
+        setGateError(
+          "That key was rejected. Use the OWNER_API_KEY from backend/.env.",
+        );
+        return;
+      }
+      setOwnerKey(key);
+      setAuthState("unlocked");
+    } catch (cause) {
+      setGateError(
+        cause instanceof Error ? cause.message : "Could not verify the key.",
+      );
+    } finally {
+      setGateBusy(false);
+    }
+  }
+
+  const run = useCallback(
+    async (label: string, action: () => Promise<unknown>, key?: string) => {
+      if (key) setBusyKey(key);
+      try {
+        await action();
+        notify("ok", label);
+        await refresh(true);
+        return true;
+      } catch (cause) {
+        if (cause instanceof ApiError && cause.status === 401) {
+          lock();
+          return false;
+        }
+        notify(
+          "err",
+          cause instanceof Error ? cause.message : "Unexpected error.",
+        );
+        return false;
+      } finally {
+        if (key) setBusyKey(null);
+      }
+    },
+    [lock, notify, refresh],
+  );
+
+  async function submitGoal(goal: string) {
+    setBusyKey("plan");
+    try {
+      const result = await api<{
+        planner: string;
+        purchases: Purchase[];
+        message?: string;
+      }>("/agent/plan", { method: "POST", body: JSON.stringify({ goal }) });
+
+      if (!result.purchases.length) {
+        notify(
+          "info",
+          result.message ?? "Nothing in the catalog matches that goal.",
+        );
+        return;
+      }
+
+      const pending = result.purchases.filter(
+        (purchase) => purchase.status === "PENDING_APPROVAL",
+      ).length;
+      const denied = result.purchases.filter(
+        (purchase) => purchase.status === "DENIED",
+      ).length;
+
+      notify(
+        denied > 0 ? "info" : "ok",
+        `${result.purchases.length} proposal${
+          result.purchases.length === 1 ? "" : "s"
+        } evaluated · ${pending} need approval · planner: ${result.planner}`,
+      );
+      setTab("purchases");
+      setFilter(pending > 0 ? "approval" : "all");
+      await refresh(true);
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 401) {
+        lock();
+        return;
+      }
+      notify(
+        "err",
+        cause instanceof Error ? cause.message : "The agent could not plan.",
+      );
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  function saveMandate(next: Mandate) {
+    const { id: _id, ...payload } = next;
+    return run(
+      "Mandate saved — new limits are already enforcing.",
+      () => api("/mandate", { method: "PUT", body: JSON.stringify(payload) }),
+      "mandate",
+    );
+  }
+
+  async function resetDemo() {
+    await run("Demo data reset.", () => api("/demo/reset", { method: "POST" }), "reset");
+    setConfirmReset(false);
+    setFilter("all");
+    setQuery("");
+    setTab("purchases");
+  }
+
+  const counts = useMemo(
+    () => purchaseCounts(workspace?.purchases ?? []),
+    [workspace?.purchases],
+  );
+
+  if (authState === "checking") {
+    return (
+      <div className="gate">
+        <div className="boot" role="status" aria-label="Checking your workspace">
+          <Logo />
+          <span className="boot-bar" aria-hidden />
+          <p>Checking your workspace…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (authState !== "unlocked") {
+    return (
+      <KeyGate
+        status={status}
+        busy={gateBusy}
+        error={gateError}
+        onSubmit={unlock}
+      />
+    );
+  }
+
+  const pending = counts.approval;
+  const statusLabel = status?.simulated
+    ? "Simulation · no real money"
+    : "PayPal sandbox · test money";
 
   return (
     <div className="app">
-      <header>
-        <div>
-          <h1>MandateGuard</h1>
-          <p className="tag">Let AI agents shop with PayPal — inside limits you control.</p>
-        </div>
-        {status && (
-          <div className="chips" aria-label="System status">
-            <span className={`chip ${status.simulated ? "warn" : "good"}`} title="Payment backend">{status.banner}</span>
-            <span className={`chip ${status.audit.valid ? "good" : "bad"}`} title="Hash-chained audit log">
-              Audit chain {status.audit.valid ? `verified (${status.audit.checked})` : "BROKEN"}
-            </span>
-            <span className="chip" title="Advisory risk model; trained on synthetic data">Risk: {status.risk_model} · {status.risk_data} data</span>
-            <span className="chip">LLM planner: {status.llm_enabled ? `${status.llm_calls_today}/${status.llm_daily_budget} calls today` : "off (local planner)"}</span>
+      <header className="app-header">
+        <div className="header-inner">
+          <div className="header-brand">
+            <Logo />
+            <span className="header-divider" aria-hidden />
+            <span className="header-tagline">Agent spending guardrails</span>
           </div>
-        )}
+
+          <div className="header-status">
+            <span className={`status-pill ${status?.simulated ? "is-sim" : "is-live"}`}>
+              <span className="dot" aria-hidden />
+              {statusLabel}
+            </span>
+            <span
+              className={`status-pill ${status?.audit.valid ? "is-good" : "is-bad"}`}
+              title="Hash-chained audit log"
+            >
+              <ShieldCheck size={13} aria-hidden />
+              {status?.audit.valid
+                ? `Audit verified · ${status.audit.checked}`
+                : "Audit unverified"}
+            </span>
+            <span className="status-pill is-muted" title="Advisory risk model, synthetic data">
+              <Gauge size={13} aria-hidden />
+              {status?.risk_model ?? "risk model"}
+            </span>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm lock-btn"
+              onClick={lock}
+              title="Lock this workspace"
+            >
+              <Lock size={13} aria-hidden />
+              Lock
+            </button>
+          </div>
+        </div>
       </header>
 
-      <div role="status" aria-live="polite" className={`toast ${msg?.kind ?? "hidden"}`}>{msg?.text}</div>
-
-      <main>
-        <section className="card" aria-labelledby="agent-h">
-          <h2 id="agent-h">1 · Give the agent a goal</h2>
-          <form onSubmit={(e) => { e.preventDefault(); if (goal.trim().length >= 3) submitGoal(goal); }}>
-            <label htmlFor="goal">What should the agent buy?</label>
-            <div className="row">
-              <input id="goal" value={goal} maxLength={500} onChange={(e) => setGoal(e.target.value)} placeholder="e.g. buy 2 reams of printer paper under $40" />
-              <button className="primary" disabled={busy || goal.trim().length < 3}>Send to agent</button>
-            </div>
-          </form>
-          <div className="chips" aria-label="Example goals">
-            {EXAMPLES.map((x) => <button key={x} className="link" disabled={busy} onClick={() => submitGoal(x)}>{x}</button>)}
+      <main className="shell">
+        <section className="hero">
+          <div>
+            <p className="eyebrow">Owner workspace</p>
+            <h1>Agent commerce, inside your mandate.</h1>
+            <p className="hero-lede">
+              The agent can propose. Policy decides. You approve. PayPal
+              settles — and everything is written to a tamper-evident log.
+            </p>
           </div>
-          {status?.simulated && (
-            <details>
-              <summary>Demo scenarios (simulation only)</summary>
-              <div className="chips">
-                {SCENARIOS.map(([k, label]) => (
-                  <button key={k} disabled={busy} onClick={() => run(`Scenario “${label}” submitted.`, () => api(`/demo/scenario/${k}`, { method: "POST" }))}>{label}</button>
-                ))}
-                <button className="danger" disabled={busy} onClick={() => confirm("Reset all demo data?") && run("Demo data reset.", () => api("/demo/reset", { method: "POST" }))}>Reset demo data</button>
-              </div>
-            </details>
+          <div className="hero-stats">
+            <div>
+              <strong>{counts.approval}</strong>
+              <span>need approval</span>
+            </div>
+            <div>
+              <strong>{counts.active}</strong>
+              <span>in flight</span>
+            </div>
+            <div>
+              <strong>{counts.paid}</strong>
+              <span>paid</span>
+            </div>
+          </div>
+        </section>
+
+        {error && (
+          <div className="banner banner-error" role="alert">
+            <TriangleAlert size={16} aria-hidden />
+            <span>{error}</span>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => void refresh()}>
+              Retry
+            </button>
+          </div>
+        )}
+
+        <section className="top-grid">
+          <AgentComposer
+            busy={busyKey === "plan"}
+            simulated={Boolean(status?.simulated)}
+            onGoal={submitGoal}
+            onScenario={(id) =>
+              void run(
+                "Demo scenario submitted.",
+                () => api(`/demo/scenario/${id}`, { method: "POST" }),
+                "plan",
+              ).then((ok) => {
+                if (!ok) return;
+                setTab("purchases");
+                setFilter("all");
+              })
+            }
+            onResetRequest={() => setConfirmReset(true)}
+          />
+          {workspace ? (
+            <BudgetCard
+              spend={workspace.spend}
+              mandate={workspace.mandate}
+              onAdjust={() => setTab("mandate")}
+            />
+          ) : (
+            <div className="panel skeleton budget-skeleton" aria-hidden />
           )}
         </section>
 
-        <section className="card" aria-labelledby="spend-h">
-          <h2 id="spend-h">Monthly budget</h2>
-          {spend && mandate ? <Gauge spend={spend} mandate={mandate} /> : <p className="muted">Loading…</p>}
+        <div className="tabs-bar">
+          <nav className="tabs" role="tablist" aria-label="Workspace views">
+            {TABS.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                role="tab"
+                id={`tab-${item.id}`}
+                aria-selected={tab === item.id}
+                aria-controls={`panel-${item.id}`}
+                tabIndex={tab === item.id ? 0 : -1}
+                className={`tab ${tab === item.id ? "is-on" : ""}`}
+                onClick={() => setTab(item.id)}
+                onKeyDown={(event) => {
+                  if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+                  const index = TABS.findIndex((candidate) => candidate.id === tab);
+                  const delta = event.key === "ArrowRight" ? 1 : -1;
+                  const next = TABS[(index + delta + TABS.length) % TABS.length]!;
+                  setTab(next.id);
+                  document.getElementById(`tab-${next.id}`)?.focus();
+                }}
+              >
+                {item.label}
+                {item.id === "purchases" && <span className="tab-count">{counts.all}</span>}
+                {item.id === "purchases" && pending > 0 && (
+                  <span className="tab-alert" aria-label={`${pending} awaiting approval`}>
+                    {pending}
+                  </span>
+                )}
+              </button>
+            ))}
+          </nav>
+          <span className="tabs-hint">
+            <Sparkles size={13} aria-hidden /> Updates every 8 seconds
+          </span>
+        </div>
+
+        {pending > 0 && tab === "purchases" && (
+          <button
+            type="button"
+            className="attention"
+            onClick={() => setFilter("approval")}
+          >
+            <span className="attention-icon">
+              <TriangleAlert size={16} aria-hidden />
+            </span>
+            <span>
+              <strong>
+                {pending} purchase{pending === 1 ? "" : "s"} waiting on you
+              </strong>
+              <small>Policy escalated these. No PayPal order exists until you approve.</small>
+            </span>
+            <span className="attention-action">Review →</span>
+          </button>
+        )}
+
+        <section
+          id={`panel-${tab}`}
+          role="tabpanel"
+          aria-labelledby={`tab-${tab}`}
+          className="panel-area"
+        >
+          {loading && !workspace ? (
+            <div className="purchase-list" aria-busy="true">
+              <div className="panel skeleton skeleton-card" />
+              <div className="panel skeleton skeleton-card" />
+            </div>
+          ) : (
+            <>
+              {tab === "purchases" && (
+                <PurchasesView
+                  purchases={workspace?.purchases ?? []}
+                  filter={filter}
+                  query={query}
+                  counts={counts}
+                  busyKey={busyKey}
+                  onFilter={setFilter}
+                  onQuery={setQuery}
+                  onApprove={(p) =>
+                    void run(
+                      "Approved — PayPal order created.",
+                      () => api(`/purchases/${p.id}/approve`, { method: "POST" }),
+                      `${p.id}:approve`,
+                    )
+                  }
+                  onReject={(p) =>
+                    void run(
+                      "Purchase rejected.",
+                      () => api(`/purchases/${p.id}/reject`, { method: "POST" }),
+                      `${p.id}:reject`,
+                    )
+                  }
+                  onCapture={(p) =>
+                    void run(
+                      "Capture verified against the provider.",
+                      () => api(`/purchases/${p.id}/capture`, { method: "POST" }),
+                      `${p.id}:capture`,
+                    )
+                  }
+                  onSimulate={(p) =>
+                    void run(
+                      "Buyer approved · webhook verified · payment captured.",
+                      () =>
+                        api(`/sim/orders/${p.provider_order_id}/approve`, {
+                          method: "POST",
+                        }),
+                      `${p.id}:simulate`,
+                    )
+                  }
+                />
+              )}
+
+              {tab === "mandate" && workspace && (
+                <MandateView
+                  mandate={workspace.mandate}
+                  categories={workspace.categories}
+                  busy={busyKey === "mandate"}
+                  onSave={saveMandate}
+                />
+              )}
+
+              {tab === "audit" && (
+                <AuditView rows={workspace?.audit ?? []} status={status} />
+              )}
+            </>
+          )}
         </section>
 
-        <nav role="tablist" aria-label="Views">
-          {(["purchases", "mandate", "audit"] as Tab[]).map((t) => (
-            <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? "tab on" : "tab"} onClick={() => setTab(t)}>
-              {t === "purchases" ? `Purchases (${purchases.length})` : t === "mandate" ? "Mandate" : "Audit log"}
-            </button>
-          ))}
-        </nav>
-
-        {tab === "purchases" && (
-          purchases.length === 0 ? <div className="card empty"><h3>No purchases yet</h3><p>Send the agent a goal above{status?.simulated ? " or run a demo scenario" : ""}. Every proposal is checked against your mandate before any PayPal order exists.</p></div>
-            : purchases.map((p) => <PurchaseCard key={p.id} p={p} busy={busy} run={run} />)
-        )}
-        {tab === "mandate" && mandate && <MandateForm mandate={mandate} busy={busy} onSave={(m) => run("Mandate saved.", () => api("/mandate", { method: "PUT", body: JSON.stringify(m) }))} />}
-        {tab === "audit" && <AuditView rows={audit} />}
+        <footer className="app-footer">
+          <span>
+            Risk scores are advisory and evaluated on synthetic data. Limits are
+            enforced by deterministic code, never by the model.
+          </span>
+          <span className="footer-badges">
+            <Badge tone="neutral">Prototype</Badge>
+            <Badge tone="neutral">Not PCI/GDPR certified</Badge>
+          </span>
+        </footer>
       </main>
-      <footer>
-        Risk scores are advisory (escalate-only) and evaluated on synthetic data. Limits are enforced by deterministic code, never by the model. Prototype — not PCI/GDPR certified.
-      </footer>
-    </div>
-  );
-}
 
-function Gauge({ spend, mandate }: { spend: Spend; mandate: Mandate }) {
-  const pct = Math.min(100, Math.round((spend.month_spent_cents / Math.max(spend.monthly_limit_cents, 1)) * 100));
-  return (
-    <div>
-      <div className="big">{money(spend.month_spent_cents, mandate.currency)} <span className="muted">of {money(spend.monthly_limit_cents, mandate.currency)}</span></div>
-      <div className="bar" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100} aria-label="Monthly budget used"><div className={pct > 85 ? "fill hot" : "fill"} style={{ width: `${pct}%` }} /></div>
-      <p className="muted small">Auto-approve ≤ {money(mandate.auto_approve_limit_cents)} · hard cap per purchase {money(mandate.per_purchase_limit_cents)} · max {mandate.max_purchases_per_day}/day{mandate.active ? "" : " · MANDATE PAUSED"}</p>
-    </div>
-  );
-}
+      {toast && <Toast toast={toast} onDismiss={dismissToast} />}
 
-const BADGE: Record<string, string> = { ALLOW: "good", REQUIRE_APPROVAL: "warn", DENY: "bad" };
-const LABEL: Record<string, string> = { ALLOW: "Within mandate", REQUIRE_APPROVAL: "Needs your approval", DENY: "Blocked" };
-
-function PurchaseCard({ p, busy, run }: { p: Purchase; busy: boolean; run: (l: string, f: () => Promise<unknown>) => Promise<void> }) {
-  const post = (path: string, label: string) => run(label, () => api(`/purchases/${p.id}/${path}`, { method: "POST" }));
-  return (
-    <article className="card purchase" aria-label={`${p.title} ${p.status}`}>
-      <div className="row between">
-        <div>
-          <h3>{p.quantity} × {p.title}</h3>
-          <p className="muted small">{p.merchant} · {p.category.replace("_", " ")} · proposed by {p.source}</p>
-        </div>
-        <div className="right"><div className="big">{money(p.amount_cents, p.currency)}</div>
-          <span className={`chip ${BADGE[p.policy_decision]}`}>{LABEL[p.policy_decision]}</span></div>
-      </div>
-      <ul className="reasons">{p.policy_reasons.map((r) => <li key={r.code} className={r.severity}><code>{r.code}</code> {r.message}</li>)}</ul>
-      <div className="risk">
-        <span className="small">Risk score {p.risk_score.toFixed(2)}</span>
-        <div className="bar thin" aria-hidden><div className={p.risk_score >= 0.5 ? "fill hot" : "fill"} style={{ width: `${Math.round(p.risk_score * 100)}%` }} /></div>
-        {p.risk_factors.map((f) => <span key={f.factor} className="chip small">{f.detail}</span>)}
-      </div>
-      <details><summary className="small">Agent justification (untrusted text)</summary><p className="quote">{p.justification}</p></details>
-      <div className="row between">
-        <span className="status">Status: <b>{p.status.replace("_", " ")}</b>{p.provider_order_id && <> · {p.simulated ? "SIMULATED order" : "PayPal sandbox order"} <code>{p.provider_order_id}</code></>}{p.capture_id && <> · capture <code>{p.capture_id}</code></>}</span>
-        <div className="row">
-          {p.status === "PENDING_APPROVAL" && <>
-            <button className="primary" disabled={busy} onClick={() => post("approve", "Approved — order created.")}>Approve</button>
-            <button disabled={busy} onClick={() => post("reject", "Purchase rejected.")}>Reject</button></>}
-          {p.status === "ORDER_CREATED" && p.simulated && <button disabled={busy} onClick={() => run("Simulated buyer approval → signed webhook → verified capture.", () => api(`/sim/orders/${p.provider_order_id}/approve`, { method: "POST" }))}>Simulate buyer approval</button>}
-          {p.status === "ORDER_CREATED" && !p.simulated && p.approve_url && <a className="btn" href={p.approve_url} target="_blank" rel="noreferrer">Approve in PayPal sandbox ↗</a>}
-          {p.status === "ORDER_CREATED" && <button disabled={busy} onClick={() => post("capture", "Capture verified with provider.")}>Verify &amp; capture</button>}
-        </div>
-      </div>
-    </article>
-  );
-}
-
-function MandateForm({ mandate, onSave, busy }: { mandate: Mandate; onSave: (m: Mandate) => void; busy: boolean }) {
-  const [f, setF] = useState(() => ({
-    name: mandate.name, per: mandate.per_purchase_limit_cents / 100, auto: mandate.auto_approve_limit_cents / 100,
-    monthly: mandate.monthly_limit_cents / 100, daily: mandate.max_purchases_per_day, cats: mandate.allowed_categories.join(", "),
-    trusted: mandate.trusted_merchants.join(", "), blocked: mandate.blocked_merchants.join(", "), active: mandate.active,
-  }));
-  const err = f.auto > f.per ? "Auto-approve limit cannot exceed the per-purchase limit." : f.per > f.monthly ? "Per-purchase limit cannot exceed the monthly limit." : "";
-  const n = (k: "per" | "auto" | "monthly" | "daily") => (e: React.ChangeEvent<HTMLInputElement>) => setF({ ...f, [k]: Number(e.target.value) });
-  return (
-    <form className="card grid" onSubmit={(e) => { e.preventDefault(); if (!err) onSave({ ...mandate, name: f.name, per_purchase_limit_cents: Math.round(f.per * 100), auto_approve_limit_cents: Math.round(f.auto * 100), monthly_limit_cents: Math.round(f.monthly * 100), max_purchases_per_day: f.daily, allowed_categories: csv(f.cats), trusted_merchants: csv(f.trusted), blocked_merchants: csv(f.blocked), active: f.active }); }}>
-      <h2>Spending mandate</h2>
-      <label>Name<input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></label>
-      <label>Auto-approve up to ({mandate.currency})<input type="number" min={0} step="0.01" value={f.auto} onChange={n("auto")} /></label>
-      <label>Hard cap per purchase<input type="number" min={0} step="0.01" value={f.per} onChange={n("per")} /></label>
-      <label>Monthly budget<input type="number" min={0} step="0.01" value={f.monthly} onChange={n("monthly")} /></label>
-      <label>Max purchases per day<input type="number" min={0} value={f.daily} onChange={n("daily")} /></label>
-      <label>Allowed categories (comma separated)<input value={f.cats} onChange={(e) => setF({ ...f, cats: e.target.value })} /></label>
-      <label>Trusted merchants<input value={f.trusted} onChange={(e) => setF({ ...f, trusted: e.target.value })} /></label>
-      <label>Blocked merchants<input value={f.blocked} onChange={(e) => setF({ ...f, blocked: e.target.value })} /></label>
-      <label className="check"><input type="checkbox" checked={f.active} onChange={(e) => setF({ ...f, active: e.target.checked })} /> Mandate active (uncheck to pause all agent spending)</label>
-      {err && <p className="err" role="alert">{err}</p>}
-      <button className="primary" disabled={busy || !!err}>Save mandate</button>
-    </form>
-  );
-}
-
-function AuditView({ rows }: { rows: AuditRow[] }) {
-  if (!rows.length) return <div className="card empty"><h3>No audit events yet</h3><p>Every proposal, approval, webhook and capture is recorded here in a tamper-evident hash chain.</p></div>;
-  return (
-    <div className="card scroll">
-      <table>
-        <thead><tr><th>#</th><th>Time (UTC)</th><th>Actor</th><th>Action</th><th>Details</th><th>Hash</th></tr></thead>
-        <tbody>{rows.map((r) => (
-          <tr key={r.id}><td>{r.id}</td><td>{r.ts.slice(11, 19)}</td><td>{r.actor}</td><td><code>{r.action}</code></td>
-            <td className="small">{JSON.stringify(r.details).slice(0, 110)}</td><td><code>{r.hash}</code></td></tr>))}</tbody>
-      </table>
+      {confirmReset && (
+        <ConfirmDialog
+          title="Reset demo data?"
+          body={
+            <>
+              This clears every purchase, order and audit event, and restores
+              the default mandate. It cannot be undone.
+            </>
+          }
+          confirmLabel="Reset everything"
+          busy={busyKey === "reset"}
+          onConfirm={() => void resetDemo()}
+          onClose={() => setConfirmReset(false)}
+        />
+      )}
     </div>
   );
 }

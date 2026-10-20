@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -55,7 +55,7 @@ class GoalIn(BaseModel):
 
 
 class MandateIn(BaseModel):
-    name: str = Field(max_length=120)
+    name: str = Field(min_length=1, max_length=120)
     per_purchase_limit_cents: int = Field(ge=0, le=100_000_000)
     auto_approve_limit_cents: int = Field(ge=0, le=100_000_000)
     monthly_limit_cents: int = Field(ge=0, le=1_000_000_000)
@@ -64,6 +64,16 @@ class MandateIn(BaseModel):
     trusted_merchants: list[str]
     blocked_merchants: list[str]
     active: bool = True
+
+    @model_validator(mode="after")
+    def coherent_limits(self):
+        # An incoherent mandate would silently make the auto-approve tier useless
+        # or allow a per-purchase cap above the monthly budget. Reject it at the edge.
+        if self.auto_approve_limit_cents > self.per_purchase_limit_cents:
+            raise ValueError("auto_approve_limit_cents cannot exceed per_purchase_limit_cents")
+        if self.per_purchase_limit_cents > self.monthly_limit_cents:
+            raise ValueError("per_purchase_limit_cents cannot exceed monthly_limit_cents")
+        return self
 
 
 def create_app(settings: Settings | None = None, session_factory: sessionmaker | None = None, provider=None) -> FastAPI:
@@ -88,6 +98,23 @@ def create_app(settings: Settings | None = None, session_factory: sessionmaker |
     app = FastAPI(title="MandateGuard", version="0.1.0", lifespan=lifespan)
     app.add_middleware(CORSMiddleware, allow_origins=[settings.frontend_url, "http://localhost:5173"],
                        allow_methods=["*"], allow_headers=["*"])
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        if request.url.path.startswith("/api"):
+            response.headers.setdefault("Cache-Control", "no-store")
+        elif request.method == "GET":
+            response.headers.setdefault(
+                "Content-Security-Policy",
+                "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+                "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+            )
+        return response
 
     def db_dep():
         db = sf()
@@ -276,7 +303,7 @@ def create_app(settings: Settings | None = None, session_factory: sessionmaker |
     def audit_log(_: str = Depends(role_dep), db: Session = Depends(db_dep)):
         rows = db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(200).all()
         return [{"id": r.id, "ts": r.ts, "actor": r.actor, "action": r.action, "purchase_id": r.purchase_id,
-                 "details": r.details, "hash": r.hash[:12]} for r in rows]
+                 "details": r.details, "hash": r.hash} for r in rows]
 
     @app.get("/api/audit/verify")
     def audit_verify(_: str = Depends(role_dep), db: Session = Depends(db_dep)):

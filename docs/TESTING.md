@@ -15,5 +15,18 @@
 ## Not verified
 Live PayPal sandbox (no credentials), Docker/docker-compose build, PostgreSQL, the optional LLM planner against the real API (only mocked transport), dependency vulnerability scan, accessibility audit with assistive technology, load testing.
 
+## Final verification (2026-10-20, before publishing)
+
+| Suite | Result |
+|---|---|
+| `cd backend && .venv/bin/python -m pytest -q` | **59 passed** |
+| `cd frontend && npx vitest run` | **34 passed** (4 files) |
+| `cd frontend && npx tsc --noEmit && npm run build` | clean |
+| `cd backend && .venv/bin/python -m pytest tests_e2e -q` (fresh simulation server, new SQLite DB) | **4 passed** |
+
+One flaky test was found and fixed here: `test_monthly_budget_enforced_across_purchases` asserted an auto-approved
+order, but the risk model legitimately escalates a first-time purchase made outside business hours, so the result
+depended on the wall clock. The test now approves the purchase if it was escalated before checking the monthly cap.
+
 ## Update
 - Added `test_stale_unapproved_order_expires_and_releases_budget` after the PayPal docs check showed orders expire; the first run of this test failed because of a wrong expectation in the test itself (the routine scenario creates two orders), fixed. Backend total: 55 passing. Browser E2E re-run after the change: see command above (3 passed).

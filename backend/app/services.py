@@ -9,6 +9,9 @@ from .models import Mandate, Purchase
 from .paypal.base import ProviderError
 
 SPEND_STATES = ("ORDER_CREATED", "CAPTURED")  # reserved + settled both count against the budget
+# Only live commitments count toward the daily cap. Rejected, expired and failed
+# attempts must not burn the owner's quota.
+COUNTED_STATES = ("PENDING_APPROVAL", "ORDER_CREATED", "CAPTURED")
 
 
 class WorkflowError(Exception):
@@ -55,7 +58,7 @@ def build_context(db: Session, mandate: Mandate, merchant: str, now: datetime, e
     base = db.query(Purchase).filter(Purchase.mandate_id == mandate.id, Purchase.status != "DENIED")
     if exclude_id:
         base = base.filter(Purchase.id != exclude_id)
-    today = base.filter(Purchase.created_at >= day_start).count()
+    today = base.filter(Purchase.created_at >= day_start, Purchase.status.in_(COUNTED_STATES)).count()
     last_hour = base.filter(Purchase.created_at >= now - timedelta(hours=1)).count()
     seen = base.filter(Purchase.merchant == merchant, Purchase.status == "CAPTURED").count() > 0
     return policy.Context(spent_this_month(db, mandate.id, now, exclude_id), today, seen), last_hour

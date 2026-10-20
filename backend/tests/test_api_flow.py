@@ -78,10 +78,14 @@ def test_owner_approval_flow_and_reject(client):
 
 def test_monthly_budget_enforced_across_purchases(client):
     m = client.get("/api/mandate", headers=OWNER).json()
-    m.update(monthly_limit_cents=5000, auto_approve_limit_cents=5000)
+    m.update(monthly_limit_cents=5000, per_purchase_limit_cents=5000, auto_approve_limit_cents=5000)
     for k in ("id",): m.pop(k)
     assert client.put("/api/mandate", headers=OWNER, json=m).status_code == 200
     first = client.post("/api/proposals", headers=AGENT, json={"sku": "PAP-002", "quantity": 1}).json()   # 39.99
+    # The risk model is advisory and may legitimately escalate a first purchase (e.g. outside business hours).
+    # Approve it so the test reaches the budget rule instead of depending on the wall clock.
+    if first["status"] == "PENDING_APPROVAL":
+        first = client.post(f"/api/purchases/{first['id']}/approve", headers=OWNER).json()
     assert first["status"] == "ORDER_CREATED"
     second = client.post("/api/proposals", headers=AGENT, json={"sku": "PAP-002", "quantity": 1}).json()  # would reach 79.98
     assert second["status"] == "DENIED" and "MONTHLY_LIMIT" in {r["code"] for r in second["policy_reasons"]}
@@ -151,6 +155,67 @@ def test_config_safety_guards():
         Settings(paypal_mode="sandbox", paypal_client_id="a", paypal_client_secret="b", paypal_webhook_id="c").validate_safety()
     Settings(paypal_mode="sandbox", paypal_client_id="a", paypal_client_secret="b", paypal_webhook_id="c",
              owner_api_key="x" * 20, agent_api_key="y" * 20).validate_safety()
+
+
+def test_mandate_rejects_incoherent_limits(client):
+    m = client.get("/api/mandate", headers=OWNER).json(); m.pop("id")
+    m["auto_approve_limit_cents"] = m["per_purchase_limit_cents"] + 1
+    assert client.put("/api/mandate", headers=OWNER, json=m).status_code == 422
+
+    m["auto_approve_limit_cents"] = 0
+    m["per_purchase_limit_cents"] = m["monthly_limit_cents"] + 1
+    assert client.put("/api/mandate", headers=OWNER, json=m).status_code == 422
+
+    m["per_purchase_limit_cents"] = 100
+    m["name"] = ""
+    assert client.put("/api/mandate", headers=OWNER, json=m).status_code == 422
+
+
+def test_security_headers_and_private_api_caching(client):
+    r = client.get("/api/health")
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert r.headers["x-frame-options"] == "DENY"
+    assert r.headers["referrer-policy"] == "no-referrer"
+    assert r.headers["cache-control"] == "no-store"
+
+    ui = client.get("/")
+    if ui.status_code == 200:  # the UI is only mounted when frontend/dist exists
+        assert "default-src 'self'" in ui.headers.get("content-security-policy", "")
+        assert ui.headers["x-frame-options"] == "DENY"
+
+
+def test_audit_returns_full_hashes(client):
+    scenario(client, "routine")
+    rows = client.get("/api/audit", headers=OWNER).json()
+    assert rows and all(len(row["hash"]) == 64 for row in rows)
+
+
+def test_daily_cap_ignores_rejected_and_expired_attempts(client):
+    from datetime import datetime, timedelta, timezone
+    from app import services
+
+    m = client.get("/api/mandate", headers=OWNER).json(); m.pop("id")
+    m.update(max_purchases_per_day=1, auto_approve_limit_cents=5000,
+             per_purchase_limit_cents=15000, monthly_limit_cents=50000)
+    assert client.put("/api/mandate", headers=OWNER, json=m).status_code == 200
+
+    pending = client.post("/api/proposals", headers=AGENT, json={"sku": "MON-001", "quantity": 1}).json()
+    assert pending["status"] == "PENDING_APPROVAL"
+
+    blocked = client.post("/api/proposals", headers=AGENT, json={"sku": "PEN-001", "quantity": 1}).json()
+    assert blocked["status"] == "DENIED"
+    assert "DAILY_COUNT" in {reason["code"] for reason in blocked["policy_reasons"]}
+
+    # A rejected proposal must not consume the daily quota.
+    client.post(f"/api/purchases/{pending['id']}/reject", headers=OWNER)
+    after_reject = client.post("/api/proposals", headers=AGENT, json={"sku": "PEN-001", "quantity": 1}).json()
+    assert after_reject["status"] == "ORDER_CREATED"
+
+    # Neither should an abandoned order that later expires.
+    with client.sf() as db:
+        services.expire_stale(db, datetime.now(timezone.utc) + timedelta(hours=4))
+    after_expiry = client.post("/api/proposals", headers=AGENT, json={"sku": "PEN-001", "quantity": 1}).json()
+    assert after_expiry["status"] == "ORDER_CREATED"
 
 
 def test_stale_unapproved_order_expires_and_releases_budget(client):

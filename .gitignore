@@ -1,8 +1,16 @@
 .env
 .env.*
 !.env.example
+*.env.rtf
+frontend/frontend.env.rtf
 venv/
 .venv/
 node_modules/
+frontend/dist/
+backend/mandateguard.db
+backend/.logs-train.log
 __pycache__/
+.logs/
+.shots/
+*.pyc
 .DS_Store
