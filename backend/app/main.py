@@ -158,8 +158,7 @@ def create_app(settings: Settings | None = None, session_factory: sessionmaker |
     def health():
         return {"ok": True}
 
-    @app.get("/api/status")
-    def status(db: Session = Depends(db_dep)):
+    def status_payload(db: Session) -> dict:
         calls = usage.llm_calls_today(db)
         return {
             "paypal_mode": provider.name, "simulated": provider.simulated,
@@ -170,9 +169,43 @@ def create_app(settings: Settings | None = None, session_factory: sessionmaker |
             "audit": audit.verify(db),
         }
 
+    def spend_payload(db: Session) -> dict:
+        m = mandate_of(db)
+        now = datetime.now(timezone.utc)
+        services.expire_stale(db, now)
+        spent = services.spent_this_month(db, m.id, now)
+        counts: dict[str, int] = {}
+        for (s,) in db.query(Purchase.status).all():
+            counts[s] = counts.get(s, 0) + 1
+        return {"month_spent_cents": spent, "monthly_limit_cents": m.monthly_limit_cents, "by_status": counts}
+
+    def catalog_payload() -> list[dict]:
+        return [{k: c[k] for k in ("sku", "title", "category", "merchant", "unit_cents", "description")} for c in CATALOG]
+
+    def audit_payload(db: Session) -> list[dict]:
+        rows = db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(200).all()
+        return [{"id": r.id, "ts": r.ts, "actor": r.actor, "action": r.action, "purchase_id": r.purchase_id,
+                 "details": r.details, "hash": r.hash} for r in rows]
+
+    @app.get("/api/status")
+    def status(db: Session = Depends(db_dep)):
+        return status_payload(db)
+
     @app.get("/api/catalog")
     def catalog(_: str = Depends(role_dep)):
-        return [{k: c[k] for k in ("sku", "title", "category", "merchant", "unit_cents")} for c in CATALOG]
+        return catalog_payload()
+
+    @app.get("/api/workspace")
+    def workspace(_: str = Depends(role_dep), db: Session = Depends(db_dep)):
+        """One snapshot for the 8-second UI poll instead of six separate requests."""
+        return {
+            "status": status_payload(db),
+            "spend": spend_payload(db),
+            "mandate": mandate_dict(mandate_of(db)),
+            "purchases": [purchase_dict(p) for p in db.query(Purchase).order_by(Purchase.created_at.desc()).limit(200)],
+            "audit": audit_payload(db),
+            "catalog": catalog_payload(),
+        }
 
     # ---------------- mandate ----------------
     @app.get("/api/mandate")
@@ -190,14 +223,7 @@ def create_app(settings: Settings | None = None, session_factory: sessionmaker |
 
     @app.get("/api/spend")
     def spend(_: str = Depends(role_dep), db: Session = Depends(db_dep)):
-        m = mandate_of(db)
-        now = datetime.now(timezone.utc)
-        services.expire_stale(db, now)
-        spent = services.spent_this_month(db, m.id, now)
-        counts: dict[str, int] = {}
-        for (s,) in db.query(Purchase.status).all():
-            counts[s] = counts.get(s, 0) + 1
-        return {"month_spent_cents": spent, "monthly_limit_cents": m.monthly_limit_cents, "by_status": counts}
+        return spend_payload(db)
 
     # ---------------- agent ----------------
     @app.post("/api/agent/plan")
@@ -301,9 +327,7 @@ def create_app(settings: Settings | None = None, session_factory: sessionmaker |
     # ---------------- audit ----------------
     @app.get("/api/audit")
     def audit_log(_: str = Depends(role_dep), db: Session = Depends(db_dep)):
-        rows = db.query(AuditEvent).order_by(AuditEvent.id.desc()).limit(200).all()
-        return [{"id": r.id, "ts": r.ts, "actor": r.actor, "action": r.action, "purchase_id": r.purchase_id,
-                 "details": r.details, "hash": r.hash} for r in rows]
+        return audit_payload(db)
 
     @app.get("/api/audit/verify")
     def audit_verify(_: str = Depends(role_dep), db: Session = Depends(db_dep)):

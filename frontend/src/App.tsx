@@ -20,6 +20,7 @@ import {
   type Purchase,
   type Spend,
   type Status,
+  type WorkspaceSnapshot,
 } from "./api";
 import { AgentComposer } from "./components/AgentComposer";
 import { AuditView } from "./components/AuditView";
@@ -29,20 +30,23 @@ import { Logo } from "./components/Logo";
 import { MandateView } from "./components/MandateView";
 import { ConfirmDialog } from "./components/Modal";
 import { PurchasesView } from "./components/PurchasesView";
+import { StoreView } from "./components/StoreView";
 import { Toast, type ToastMessage } from "./components/Toast";
 import { Badge } from "./components/ui";
 import { purchaseCounts, sortPurchases, type PurchaseFilter } from "./lib/purchases";
 
-type Tab = "purchases" | "mandate" | "audit";
+type Tab = "store" | "purchases" | "mandate" | "audit";
 type Workspace = {
   spend: Spend;
   mandate: Mandate;
   purchases: Purchase[];
   audit: AuditRow[];
+  catalog: CatalogItem[];
   categories: string[];
 };
 
 const TABS: { id: Tab; label: string }[] = [
+  { id: "store", label: "Storefront" },
   { id: "purchases", label: "Purchases" },
   { id: "mandate", label: "Mandate" },
   { id: "audit", label: "Audit log" },
@@ -59,7 +63,7 @@ export default function App() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>("purchases");
+  const [tab, setTab] = useState<Tab>("store");
   const [filter, setFilter] = useState<PurchaseFilter>("all");
   const [query, setQuery] = useState("");
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -117,15 +121,15 @@ export default function App() {
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [nextStatus, spend, mandate, purchases, audit, catalog] =
-        await Promise.all([
-          api<Status>("/status"),
-          api<Spend>("/spend"),
-          api<Mandate>("/mandate"),
-          api<Purchase[]>("/purchases"),
-          api<AuditRow[]>("/audit"),
-          api<CatalogItem[]>("/catalog"),
-        ]);
+      const snapshot = await api<WorkspaceSnapshot>("/workspace");
+      const {
+        status: nextStatus,
+        spend,
+        mandate,
+        purchases,
+        audit,
+        catalog,
+      } = snapshot;
 
       setStatus(nextStatus);
       setWorkspace({
@@ -133,6 +137,7 @@ export default function App() {
         mandate,
         purchases: sortPurchases(purchases),
         audit,
+        catalog,
         categories: Array.from(new Set(catalog.map((item) => item.category))),
       });
       setError(null);
@@ -247,6 +252,59 @@ export default function App() {
         "err",
         cause instanceof Error ? cause.message : "The agent could not plan.",
       );
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function buyProduct(
+    item: CatalogItem,
+    quantity: number,
+  ): Promise<Purchase | null> {
+    setBusyKey("store");
+    try {
+      const purchase = await api<Purchase>("/proposals", {
+        method: "POST",
+        body: JSON.stringify({
+          sku: item.sku,
+          quantity,
+          justification: "Storefront checkout by the owner",
+        }),
+      });
+
+      if (purchase.status === "DENIED") {
+        notify(
+          "err",
+          `Blocked by policy: ${purchase.policy_reasons[0]?.message ?? "outside your mandate."}`,
+        );
+      } else if (purchase.status === "PENDING_APPROVAL") {
+        notify(
+          "info",
+          "Policy escalated this purchase. Review it under Purchases.",
+        );
+        setFilter("approval");
+      } else {
+        notify(
+          purchase.simulated ? "ok" : "info",
+          purchase.simulated
+            ? "Simulated order created. Approve it as the buyer to capture."
+            : "PayPal sandbox order created. Approve it with the buyer account.",
+        );
+        setFilter("all");
+      }
+      setTab("purchases");
+      await refresh(true);
+      return purchase;
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 401) {
+        lock();
+        return null;
+      }
+      notify(
+        "err",
+        cause instanceof Error ? cause.message : "Checkout failed.",
+      );
+      return null;
     } finally {
       setBusyKey(null);
     }
@@ -517,6 +575,18 @@ export default function App() {
                       `${p.id}:simulate`,
                     )
                   }
+                />
+              )}
+
+              {tab === "store" && workspace && (
+                <StoreView
+                  items={workspace.catalog}
+                  mandate={workspace.mandate}
+                  monthSpentCents={workspace.spend.month_spent_cents}
+                  simulated={Boolean(status?.simulated)}
+                  busy={busyKey === "store"}
+                  onBuy={buyProduct}
+                  onAdjustMandate={() => setTab("mandate")}
                 />
               )}
 

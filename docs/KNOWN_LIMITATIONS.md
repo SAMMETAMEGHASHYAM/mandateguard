@@ -4,7 +4,7 @@
 - Orders expire (docs: ~3 h to capture). Unapproved orders are marked `EXPIRED` lazily (on next request) and their reserved budget is released; there is no background scheduler.
 - The default demo runs in **simulation**; simulated orders are not PayPal transactions and are labelled as such everywhere.
 - Risk model is trained and evaluated on **synthetic data** with labels from the same generator as the features; recall ≈0.66 at precision ≈0.94 there (docs/EVAL_RESULTS.md). It says nothing about real-world accuracy. That is why it is advisory/escalate-only.
-- Catalog is synthetic (13 items). A real merchant/product source (e.g. a Channel3 adapter) is not implemented.
+- The storefront is a UI over the same synthetic catalog (13 items). There is no cart persistence, inventory, shipping, tax, or real merchant account; checkout creates a PayPal order for the demo merchant. A real product source (e.g. a Channel3 adapter) is not implemented.
 - Auth is two static API keys (demo); no user accounts or multi-tenant isolation. Single mandate.
 - Rate limit and planner cache are in-memory (single process).
 - Docker files untested here; Postgres untested.

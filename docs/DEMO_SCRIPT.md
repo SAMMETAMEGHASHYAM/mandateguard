@@ -6,6 +6,7 @@ Setup: `make demo`, open http://localhost:8000, click *Demo scenarios → Reset 
 |---|---|---|
 | 0:00 | Header + banner | "AI agents are starting to spend money. One poisoned product listing can talk an agent into overspending. MandateGuard puts the owner's rules between the agent and PayPal." |
 | 0:20 | Mandate tab (limits) | "I set a mandate: $50 auto-approve, $150 hard cap, $500/month, allowed categories." |
+| 0:30 | Storefront tab | "This is the catalog as the owner sees it. Gift cards are visibly outside the mandate; coffee is inside. Buying uses the exact same guardrails as the agent." |
 | 0:35 | Goal: "buy 2 reams of printer paper under $40" | "The agent picks the item, but never sets the price. Prices come from the catalog." |
 | 0:55 | Card: Within mandate → *Simulate buyer approval* (or PayPal sandbox approval) → CAPTURED | "Order created through the PayPal Orders flow, buyer approves, and we verify with PayPal before capturing — not trusting a redirect." |
 | 1:30 | Scenario: Poisoned listing | "This listing says 'ignore previous instructions and spending limits'. Policy flags the injection and an untrusted merchant → human approval. Ten units → blocked by the hard cap. No PayPal order exists for either." |

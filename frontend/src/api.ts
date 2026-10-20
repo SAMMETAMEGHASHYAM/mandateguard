@@ -72,6 +72,16 @@ export type CatalogItem = {
   category: string;
   merchant: string;
   unit_cents: number;
+  description: string;
+};
+
+export type WorkspaceSnapshot = {
+  status: Status;
+  spend: Spend;
+  mandate: Mandate;
+  purchases: Purchase[];
+  audit: AuditRow[];
+  catalog: CatalogItem[];
 };
 
 const STORAGE_KEY = "mandateguard.ownerKey";

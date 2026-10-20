@@ -19,10 +19,22 @@ Live PayPal sandbox (no credentials), Docker/docker-compose build, PostgreSQL, t
 
 | Suite | Result |
 |---|---|
-| `cd backend && .venv/bin/python -m pytest -q` | **59 passed** |
-| `cd frontend && npx vitest run` | **34 passed** (4 files) |
+| `cd backend && .venv/bin/python -m pytest -q` | **60 passed** |
+| `cd frontend && npx vitest run` | **41 passed** (5 files) |
 | `cd frontend && npx tsc --noEmit && npm run build` | clean |
-| `cd backend && .venv/bin/python -m pytest tests_e2e -q` (fresh simulation server, new SQLite DB) | **4 passed** |
+| `cd backend && .venv/bin/python -m pytest tests_e2e -q` (simulation server) | **5 passed** |
+
+The storefront was added after the first publish: product catalog/search, a checkout modal with client-side mandate
+pre-checks (the server still re-checks), and a guarded order path. New coverage: `test_catalog_exposes_products_and_untrusted_descriptions`,
+`store.test.ts`, and `test_storefront_checkout_creates_guarded_order`.
+
+Two issues surfaced while running the expanded E2E suite in one session:
+
+1. **429 responses from the app's own polling.** The UI fetched six endpoints every 8 seconds (45 requests/min/tab),
+   so several open tabs exhausted the 120/min limit. Added `GET /api/workspace`, a single snapshot the UI now polls;
+   the per-feature endpoints remain for actions and tests.
+2. **E2E tabs were never closed**, so their polling continued between tests. The suite now closes every browser
+   context after each test.
 
 One flaky test was found and fixed here: `test_monthly_budget_enforced_across_purchases` asserted an auto-approved
 order, but the risk model legitimately escalates a first-time purchase made outside business hours, so the result

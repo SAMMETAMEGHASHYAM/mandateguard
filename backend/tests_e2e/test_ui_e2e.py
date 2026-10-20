@@ -35,6 +35,19 @@ def browser():
         browser.close()
 
 
+@pytest.fixture(autouse=True)
+def close_contexts(browser):
+    """Close every tab after each test.
+
+    Open tabs keep polling the workspace every 8 seconds. Leaving them open
+    across tests exhausted the per-key rate limit and made later tests read
+    429 responses instead of the state they just created.
+    """
+    yield
+    for context in browser.contexts:
+        context.close()
+
+
 def new_page(browser, width=1280, height=900):
     context = browser.new_context(viewport={"width": width, "height": height})
     page = context.new_page()
@@ -137,6 +150,29 @@ def test_mandate_validation_and_save(browser):
     page.screenshot(path=f"{SHOTS}/04-mandate-desktop.png", full_page=True)
 
 
+def test_storefront_checkout_creates_guarded_order(browser):
+    page = new_page(browser)
+    unlock(page)
+
+    page.get_by_role("tab", name="Storefront").click()
+    expect(page.get_by_text("Shop inside your mandate")).to_be_visible()
+    expect(page.get_by_text("Demo catalog")).to_be_visible()
+    page.screenshot(path=f"{SHOTS}/07-store-desktop.png", full_page=True)
+
+    page.get_by_label("Search the catalog").fill("coffee")
+    page.get_by_role("button", name="Buy now").click()
+    expect(page.get_by_role("heading", name="Checkout")).to_be_visible()
+    expect(
+        page.get_by_text("Category, hard cap and monthly budget all pass.")
+    ).to_be_visible()
+    page.get_by_role("button", name="Place simulated order").click()
+
+    expect(page.locator("#tab-purchases")).to_have_attribute(
+        "aria-selected", "true"
+    )
+    expect(page.get_by_text("Coffee beans 1kg medium roast")).to_be_visible()
+
+
 def test_mobile_layout_has_no_horizontal_overflow(browser):
     page = new_page(browser, 390, 844)
     expect(page.get_by_role("heading", name="Owner access")).to_be_visible()
@@ -146,6 +182,8 @@ def test_mobile_layout_has_no_horizontal_overflow(browser):
     assert gate_overflow <= 1, f"gate overflow {gate_overflow}px"
 
     unlock(page)
+    page.get_by_role("tab", name="Storefront").click()
+    expect(page.get_by_text("Shop inside your mandate")).to_be_visible()
     overflow = page.evaluate(
         "document.documentElement.scrollWidth - document.documentElement.clientWidth"
     )

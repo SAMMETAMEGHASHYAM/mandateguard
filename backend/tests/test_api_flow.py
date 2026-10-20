@@ -16,6 +16,23 @@ def test_auth_required_and_roles(client):
     assert client.put("/api/mandate", headers=AGENT, json={}).status_code == 403
 
 
+def test_catalog_exposes_products_and_untrusted_descriptions(client):
+    items = client.get("/api/catalog", headers=OWNER).json()
+    assert len(items) >= 10
+    coffee = next(item for item in items if item["sku"] == "COF-001")
+    assert coffee["unit_cents"] == 1899 and coffee["category"] == "pantry"
+    assert "Whole bean arabica" in coffee["description"]
+    assert client.get("/api/catalog").status_code == 401
+
+    snapshot = client.get("/api/workspace", headers=OWNER)
+    assert snapshot.status_code == 200
+    body = snapshot.json()
+    assert set(body) == {"status", "spend", "mandate", "purchases", "audit", "catalog"}
+    assert len(body["catalog"]) == len(items)
+    assert body["mandate"]["monthly_limit_cents"] == 50000
+    assert client.get("/api/workspace").status_code == 401
+
+
 def test_status_labels_simulation(client):
     s = client.get("/api/status").json()
     assert s["simulated"] and "SIMULATION" in s["banner"] and s["risk_data"] == "synthetic"
